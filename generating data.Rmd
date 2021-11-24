@@ -1,0 +1,306 @@
+---
+title: "Synthetic Data Generation"
+output: html_notebook
+---
+
+This notebook contains functions which generate synthetic data.
+We would like to be able to generate data scenario 1 from the 'Generating Synthetic Data' section of the project. Therefore, we only consider the situation where $L\subset B$. This data will be used in simulation studies. We can keep X and E fixed to improve the computation time, this is returned in a separate list to the datasets.
+For each dataset the following information is returned:
+
+1. $Y$- a vector of disease outcomes
+2. $\Pi$ a response vector of probabilities
+3. $\beta$ - vector of the SNP coefficients used
+4. $\alpha$- numeric of the environment coefficient 
+5. $\delta$ - full vector of the gene-environment interaction term
+6. a vector of the indices of those SNPs with non-zero marginal coefficients 
+7. vector of the indices of those SNPs with non-zero interaction coefficients
+
+```{r}
+library(glmnet)
+```
+
+```{r}
+synthetic_data<-function(n,m,N,prev, prev_s,prev_i){
+  #n - number of individuals
+  #m number of SNPs
+  #N - number of datasets to generate
+  #prev - prevalance of environmental exposure [0,1]
+  #prev_s - prevalance of SNPs with effect [0,1]
+  #prev_i - prevalance of genes with marginal effects with an interaction  (0,1]
+    #data is also produced for no interaction 
+  
+  
+   
+  #returns a list containing the following
+  #Common - a list of the inputs common to all models
+    #X_mat - design matrix, not including intercept terms
+    #Env - vector of environmental terms
+    #MAF - vector MAF values used for the SNPs
+  #Data - a list of N lists, each containing the following:
+    #Y - a vector of disease outcomes
+    #Pi- a response vector of probabilities
+    #Y0 - a vector of disease outcomes when no interactions are present
+    #Pi0- a response vector of probabilities when no interactions are present
+    #Beta - vector of the SNP coefficients used
+    #Alpha - numeric of the environment coefficient 
+    #Snps1 -vector of the indices of those SNPs with non-zero marginal coefficients 
+    #Interactions - vector of the indices of those SNPs with non-zero interaction coefficients
+    #Delta - full vector of the gene-environment interaction term
+  
+  #create a vector with the p values for the SNPS
+  p_vec<-runif(m, min=0.07, max=0.45)
+  #start design matrix X with intercept column
+  X<-rep(1,n)
+  #add on SNPs for data
+  for (i in 1:m){
+    SNP<-rbinom(n,2,p_vec[i])
+    X<-cbind(X,SNP)
+  }
+  E<-rbinom(n,1,prev) 
+  m_b<-floor(prev_s*m) # number of snps with non-zero beta terms
+  n_i<-floor(prev_i*m_b) #number of gene-environment interactions 
+  #Store data common to all datasets
+  common<- list(X_mat=X[,2:(m+1)],Env=E, MAF=p_vec)
+  #Set up storage of datasets
+  data_list<-vector(mode = "list", length = N)
+  #Create N datasets
+  for(k in 1:N){
+    beta<-rep(0,m)
+    snps1<-sample(1:m,m_b, replace=FALSE) #index those snps with none zero beta terms
+    beta[snps1]<-rnorm(m_b,0,1)
+    #add intercept coefficient
+    beta<-append(rnorm(1,0,1),beta)
+    alpha<-rnorm(1,0,1) #environmental impact 
+    delta<-rep(0,m)
+    interactions<-sample(snps1,n_i,replace = FALSE) #select index of subset of SNPs with 
+    #marginal effect that also have interaction effect
+    delta[interactions]<-rnorm(n_i,0,1)
+    eta<-X%*%beta + alpha*E + (E*X[,2:(m+1)])%*%delta
+    pi<-as.vector(1/(1+exp(-eta)))
+    y<-rbinom(n,1,pi)
+    #the same for no interactions- to allow calculation of FPR
+    eta_0<-X%*%beta + alpha*E
+    pi_0<-as.vector(1/(1+exp(-eta_0)))
+    y_0<-rbinom(n,1,pi_0)
+    data_list[[k]]<-  list(Y=y,Pi=pi,Y0=y_0,Pi0=pi_0, Beta=beta,Alpha=alpha,SNPs=snps1,Int=interactions, Delta=delta)
+  }
+  return(list(Common=common, Data=data_list))
+}
+```
+
+We would now like to be able to perform a simulation study on a set of datasets to calculate the false postive ratio. 
+
+
+First, we make a function that performs a standard univariate analysis. It employs a logistic regression model.
+```{r}
+lr_test<-function(y,X,E,SNP){
+  #y- vector of responses (nx1)
+  #X - design matrix of SNPs (nx(number of SNPs considered))
+  #E- vector of environmental factor
+  #SNP- number of the SNP to be tested
+  
+  #select relevant column of SNPs data
+  X_col<-X[,SNP]
+  mat<-cbind.data.frame(X_col,E,E*X_col)
+  logitmod1<-glm(y~., family=binomial(link='logit'),data=mat)
+  logitmod2<-glm(y~X_col+E, family=binomial(link='logit'),data=mat)
+  pval<-anova(logitmod2,logitmod1,test="Chisq")[2,5]
+  return(pval)
+}
+```
+
+
+We now define a function that perfoms LASSO on a dataset. We use cross-validation to find the optimal regularisation parameter.
+```{r}
+lasso_test<-function(y,X,E){
+  #y- vector of responses (nx1)
+  #X - design matrix for m SNPs (nxm)
+  #E- vector of environmental factor
+  
+  #returns a 2m+1 length parameter estimate vector 
+  mat<-cbind.data.frame(X,E,E*X)
+  m<-(dim(X)[2])
+  names(mat)<-1:(2*m+1)
+  Lambda<-(cv.glmnet(as.matrix(mat), as.vector(y), family=binomial,standardize = TRUE))$lambda.min
+  return(as.matrix(glmnet(as.matrix(mat), as.vector(y), family=binomial,standardize = TRUE, lambda=Lambda)[["beta"]])[(m+2):(2*m+1)])
+}
+
+```
+
+We would like to build a function which performs a simualtion study of statistical tests.
+```{r}
+sim_study<-function(n,m,N,prev, prev_s,prev_i){
+  #INPUTS
+  #n - number of individuals
+  #m number of SNPs
+  #N - number of datasets to generate
+  #prev - prevalance of environmental exposure [0,1]
+  #prev_s - prevalance of SNPs with effect [0,1]
+  #prev_i - prevalance of genes with marginal effects with an interaction  [0,1]
+    #setting to 0 gives scenario 2
+  
+  #RETURNS:
+  #List containing the following:
+  #LR - vector containing the p values for all lr tests performed
+  #LR0 -vector containing the p values for all lr tests performed on the dataset for non ints
+  #LR_truth - truth of interactions
+  #LA - vector containing the p values for interaction tests of non-zero marginal
+  #coefficients for all lasso tests performed
+  #LA0 - vector containing the p values for interaction tests of non-zero marginal
+  #int_truth - truth of interactions
+  #LA_truth - truth of interactions
+  
+  
+  #initialise storage of p values
+  p_vec_lr<-rep(0,floor(prev_s*m)*N) #set up store of values for each p value
+  p_vec_lr_0<-rep(0,floor(prev_s*m)*N) #set up store of values for each p value for no interactions
+  int_truth<-c() #set up storage of truth of interaction
+  int_truth_all<-c() #set up storage of truth of interaction
+  #coeffs_lasso<-rep(0,floor(prev_s*m)*N) 
+  coeffs_lasso<-c()#set up store of values for each p value
+  coeffs_lasso_0<-c()#set up store of values for each p value
+  #simulate data
+  synth_data<-synthetic_data(n,m,N,prev, prev_s,prev_i)
+  dataset<-synth_data$Data
+  common<-synth_data$Common
+  X<-common$X_mat
+  E<-common$Env
+  #perform tests
+  #initialise index of p_value vector
+  j<-1
+  for(k in 1:N){
+    data<-dataset[[k]]
+    y<-data$Y
+    y0<-data$Y0
+    X_rel<-X[,data$SNPs]#extract relevant X matrix (columns corresponding to 
+    # SNPs with non-zero marginal effects
+    #perform univariate analysis on each SNP with non-zero marginal effects
+    for(i in 1:(length(data$SNPs))){
+      p_vec_lr[j]<-lr_test(y,X_rel,E,i)
+      p_vec_lr_0[j]<-lr_test(y0,X_rel,E,i)
+      j<-j+1 #update storage index
+    }
+    #add truth of whether interaction is present or not for tests performed
+    int_truth<-c(int_truth,as.integer((data$Delta[data$SNPs])!=0)) 
+    #add truth of whether interaction is present or not for tests performed- for all not just marginal
+    int_truth_all<-c(int_truth_all,as.integer((data$Delta)!=0)) 
+    #perform lasso on all SNPs, store results
+    coeffs_lasso<-c(coeffs_lasso, lasso_test(y,X,E))
+    coeffs_lasso_0<-c(coeffs_lasso_0, lasso_test(y0,X,E))
+  }
+  return(list(LR=p_vec_lr,LR0=p_vec_lr_0,Truth=int_truth,LA=coeffs_lasso,LA0=coeffs_lasso_0,
+              Truth_la=int_truth_all))
+}
+```
+
+
+We now define a function which combines all aspects of the above to return FPR etc for a test. 
+V is the number of false positives (Type I error) (also called "false discoveries") (no interaction, but interaction detected)
+S is the number of true positives (also called "true discoveries") (interaction present, interaction detected)
+T is the number of false negatives (Type II error) (interaction present, not detected)
+U is the number of true negatives (interaction not present, not detected)
+```{r}
+test_table<-function(trials,alpha){
+  #INPUTS
+  #trials - an object from sim_study(n,m,N,prev, prev_s,prev_i)
+    #this is list(LR=p_vec_lr,LR0=p_vec_lr_0,LR_truth=int_truth,LA=p_vec_lasso,LA0=p_vec_lasso_0,LA_truth=int_truth_all)
+  #alpha- confidence level of tests
+  
+  
+  #logistic regression
+  #interactions present 
+  S<-sum(c(trials$LR[(trials$Truth)==1]<=alpha))#number of true positives
+  T1<-sum(c(trials$LR[(trials$Truth)==1]>alpha)) #number of false negatives
+  V<-sum(c(trials$LR[(trials$Truth)==0]<=alpha)) #number of false positives - type 1 error
+  U<-sum(c(trials$LR[(trials$Truth)==0]>alpha)) #number of true negatives
+  lr_int<-c(S,T1,V,U)
+  
+  #no interactions 
+  V0<-sum(c(trials$LR0<=alpha)) #number of false positives - type 1 error
+  U0<-sum(c(trials$LR0>alpha)) #number of true negatives
+  lr_null<-c(0,0,V0,U0) 
+
+  
+  #lasso
+  #interactions present 
+  S_la<-sum(c(trials$LA[(trials$Truth_la)==1]!=0))#number of true positives
+  T_la<-sum(c(trials$LA[(trials$Truth_la)==1]==0)) #number of false negatives
+  V_la<-sum(c(trials$LA[(trials$Truth_la)==0]!=0)) #number of false positives - type 1 error
+  U_la<-sum(c(trials$LA[(trials$Truth_la)==0]==0)) #number of true negatives
+  la_int<-c(S_la,T_la,V_la,U_la)
+  
+  #no interactions 
+  V_la0<-sum(c(trials$LA0!=0)) #number of false positives - type 1 error
+  U_la0<-sum(c(trials$LA0==0)) #number of true negatives
+  la_null<-c(0,0,V_la0,U_la0) 
+  
+  return(list(LR_I=lr_int,LR_0=lr_null,LA_I=la_int,LA_0=la_null))
+}
+```
+
+Finally, we define a function to calculate the test statistics.
+```{r}
+stats<-function(cont_vec){
+  #cont_tvec - a summary vector of the results of the tests
+    #a list containing: S, T, V, U (as defined above)
+  #returns a vector of test stats
+    #recall
+    #specificity 
+    #accuracy
+    #precision
+    #f-score
+    #fpr
+    #summ- a vector of the results for use in the table
+  rec<-cont_vec[1]/(cont_vec[1]+cont_vec[2]) #TP/(TP+FN)
+  spec<-cont_vec[4]/(cont_vec[3]+cont_vec[4])
+  acc<-(cont_vec[1]+cont_vec[4])/(sum(cont_vec))
+  prec<-cont_vec[1]/(cont_vec[1]+cont_vec[3]) #TP/(TP+FP)
+  f_score<-2*(prec*rec)/(prec+rec)
+    
+  return(list(Recall=rec, Specificity=spec, Accuracy=acc, Precision=prec,F_score=f_score, FPR=(1-spec), Summ=c(rec,spec,acc,prec,f_score,1-spec)))
+}
+
+```
+
+
+
+```{r}
+whole_sim<-function(n,m,N,prev, prev_s,prev_i,alpha){
+  #inputs 
+    #n - number of individuals
+    #m number of SNPs
+    #N - number of datasets to generate
+    #prev - prevalance of environmental exposure [0,1]
+    #prev_s - prevalance of SNPs with effect [0,1]
+    #prev_i - prevalance of genes with marginal effects with an interaction  [0,1]
+    #alpha - confidence level of test 
+  #returns
+  #list containing test stats for the different models
+  trial1<-sim_study(n,m,N,prev, prev_s,prev_i)
+  tables<-test_table(trial1,alpha)
+  lr<-stats(tables$LR_I)
+  lr0<-stats(tables$LR_0)
+  la<-stats(tables$LA_I)
+  la0<-stats(tables$LA_0)
+  df<-data.frame(lr$Summ,lr0$Summ,la$Summ,la0$Summ)
+  names(df)<-c("LR - Interactions","LR - No Interactions","Lasso- Interactions", "Lasso- No Interactions")
+  rownames(df)<-c("Recall", "Specificity", "Accuracy", "Precision","F_score", "FPR")
+  print(df)
+  return(list(LR=lr,LR0=lr0,LA=la,LA0=la0, All=df))
+}
+
+```
+
+```{r}
+n1<-500
+m1<-100
+N1<-100
+prev1<-0.6
+prev_s1<-0.6
+prev_i1<-0.4
+alpha1<-0.05
+#test<-sim_study(n1,m1,N1,prev1, prev_s1,prev_i1)
+sim<-whole_sim(n1,m1,N1,prev1, prev_s1,prev_i1,alpha1)
+
+```
+
